@@ -4,6 +4,14 @@ from json import loads, dumps
 from sqlite3 import connect, IntegrityError
 from datetime import datetime
 
+# Função para enviar dados com um delimitador de nova linha
+def send_with_delimiter(sock, data):
+    """Envia dados JSON seguidos por um caractere de nova linha."""
+    try:
+        sock.sendall(dumps(data).encode('utf-8') + b'\n')
+    except (ConnectionResetError, BrokenPipeError):
+        pass # O cliente pode ter se desconectado
+
 def init_db():
     """Cria as tabelas do banco de dados se não existirem."""
     conn = connect('chat.db')
@@ -52,28 +60,33 @@ class Server:
     def handle_client(self, client_socket):
         """Gerencia a comunicação com um cliente específico."""
         user = None
+        buffer = ""
         try:
             while True:
-                request_data = client_socket.recv(2048).decode('utf-8')
-                if not request_data:
+                data = client_socket.recv(2048).decode('utf-8')
+                if not data:
                     break
                 
-                request = loads(request_data)
-                command = request.get('command')
+                buffer += data
+                while '\n' in buffer:
+                    message_str, buffer = buffer.split('\n', 1)
+                    request = loads(message_str)
+                    
+                    command = request.get('command')
 
-                if command == 'register':
-                    self._register(client_socket, request)
-                elif command == 'login':
-                    user = self._login(client_socket, request)
-                elif user: # A partir daqui, só comandos de quem está logado
-                    if command == 'get_users':
-                        self._send_user_list()
-                    elif command == 'msg':
-                        self._route_message(request)
-                    elif command == 'typing':
-                        self._notify_typing(request)
+                    if command == 'register':
+                        self._register(client_socket, request)
+                    elif command == 'login':
+                        user = self._login(client_socket, request)
+                    elif user:
+                        if command == 'get_users':
+                            self._send_user_list()
+                        elif command == 'msg':
+                            self._route_message(request)
+                        elif command == 'typing':
+                            self._notify_typing(request)
 
-        except (ConnectionResetError, ValueError):
+        except (ConnectionResetError, ValueError, ConnectionAbortedError):
             print(f"Conexão com {user if user else 'desconhecido'} perdida.")
         finally:
             if user:
@@ -81,6 +94,7 @@ class Server:
                     if user in self.clients:
                         del self.clients[user]
                 self._broadcast_status(user, 'offline')
+                self._send_user_list()
             client_socket.close()
 
     def _register(self, client_socket, request):
@@ -92,9 +106,9 @@ class Server:
         try:
             cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, password))
             conn.commit()
-            client_socket.send(dumps({"status": "ok", "message": "Registrado com sucesso!"}).encode('utf-8'))
+            send_with_delimiter(client_socket, {"status": "ok", "message": "Registrado com sucesso!"})
         except IntegrityError:
-            client_socket.send(dumps({"status": "error", "message": "Usuário já existe."}).encode('utf-8'))
+            send_with_delimiter(client_socket, {"status": "error", "message": "Usuário já existe."})
         finally:
             conn.close()
 
@@ -111,14 +125,16 @@ class Server:
         if user_data:
             with self.lock:
                 self.clients[username] = client_socket
-            
-            client_socket.send(dumps({"status": "ok", "message": "Login bem-sucedido!"}).encode('utf-8'))
+
+            send_with_delimiter(client_socket, {"status": "ok", "message": "Login bem-sucedido!"})
             print(f"Usuário '{username}' logado.")
+
             self._broadcast_status(username, 'online')
+            self._send_user_list()
             self._send_offline_messages(username)
             return username
         else:
-            client_socket.send(dumps({"status": "error", "message": "Usuário ou senha inválidos."}).encode('utf-8'))
+            send_with_delimiter(client_socket, {"status": "error", "message": "Usuário ou senha inválidos."})
             return None
 
     def _send_user_list(self):
@@ -131,17 +147,10 @@ class Server:
 
         with self.lock:
             online_users = list(self.clients.keys())
-            
-        user_list_with_status = {user: ('online' if user in online_users else 'offline') for user in all_users}
-
-        response = dumps({"command": "user_list", "users": user_list_with_status})
-        
-        with self.lock:
+            user_list_with_status = {user: ('online' if user in online_users else 'offline') for user in all_users}
+            response = {"command": "user_list", "users": user_list_with_status}
             for client_sock in self.clients.values():
-                try:
-                    client_sock.send(response.encode('utf-8'))
-                except:
-                    pass
+                send_with_delimiter(client_sock, response)
 
     def _route_message(self, request):
         """Roteia uma mensagem para o destinatário ou a armazena se offline."""
@@ -149,17 +158,13 @@ class Server:
         sender = request.get('from')
         message_text = request.get('body')
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         request['timestamp'] = timestamp
-        
+
         with self.lock:
             recipient_socket = self.clients.get(recipient)
 
         if recipient_socket:
-            try:
-                recipient_socket.send(dumps(request).encode('utf-8'))
-            except:
-                self._store_offline_message(recipient, sender, message_text, timestamp)
+            send_with_delimiter(recipient_socket, request)
         else:
             self._store_offline_message(recipient, sender, message_text, timestamp)
 
@@ -181,19 +186,19 @@ class Server:
         messages = cursor.fetchall()
 
         if messages:
-            client_sock = self.clients.get(username)
-            for sender, message, timestamp in messages:
-                msg_packet = {
-                    "command": "msg", "from": sender, "to": username,
-                    "body": message, "timestamp": timestamp
-                }
-                try:
-                    client_sock.send(dumps(msg_packet).encode('utf-8'))
-                except:
-                    pass
+            with self.lock:
+                client_sock = self.clients.get(username)
             
-            cursor.execute("DELETE FROM offline_messages WHERE recipient = ?", (username,))
-            conn.commit()
+            if client_sock:
+                for sender, message, timestamp in messages:
+                    msg_packet = {
+                        "command": "msg", "from": sender, "to": username,
+                        "body": message, "timestamp": timestamp
+                    }
+                    send_with_delimiter(client_sock, msg_packet)
+                
+                cursor.execute("DELETE FROM offline_messages WHERE recipient = ?", (username,))
+                conn.commit()
         conn.close()
 
     def _notify_typing(self, request):
@@ -201,25 +206,15 @@ class Server:
         recipient = request.get('to')
         with self.lock:
             recipient_socket = self.clients.get(recipient)
-        
         if recipient_socket:
-            try:
-                recipient_socket.send(dumps(request).encode('utf-8'))
-            except:
-                pass
-    
+            send_with_delimiter(recipient_socket, request)
+
     def _broadcast_status(self, username, status):
         """Informa a todos sobre a mudança de status de um usuário."""
-        response = dumps({"command": "status_update", "user": username, "status": status})
+        response = {"command": "status_update", "user": username, "status": status}
         with self.lock:
-            # Envia a lista de usuários atualizada para todos
-            self._send_user_list()
-            # Envia a notificação específica de status
             for client_sock in self.clients.values():
-                try:
-                    client_sock.send(response.encode('utf-8'))
-                except:
-                    pass
+                send_with_delimiter(client_sock, response)
 
 if __name__ == "__main__":
     server = Server()
