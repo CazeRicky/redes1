@@ -1,25 +1,28 @@
+# server.py
+
 from socket import socket, AF_INET, SOCK_STREAM
 from threading import Thread, Lock
 from json import loads, dumps
 from sqlite3 import connect, IntegrityError
 from datetime import datetime
+import hashlib
 
-# Função para enviar dados com um delimitador de nova linha
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
 def send_with_delimiter(sock, data):
-    """Envia dados JSON seguidos por um caractere de nova linha."""
     try:
         sock.sendall(dumps(data).encode('utf-8') + b'\n')
     except (ConnectionResetError, BrokenPipeError):
-        pass # O cliente pode ter se desconectado
+        pass
 
 def init_db():
-    """Cria as tabelas do banco de dados se não existirem."""
-    conn = connect('chat.db')
+    conn = connect('chat.db', check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
-            password TEXT NOT NULL
+            password_hash TEXT NOT NULL
         )
     ''')
     cursor.execute('''
@@ -28,9 +31,8 @@ def init_db():
             recipient TEXT NOT NULL,
             sender TEXT NOT NULL,
             message TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            FOREIGN KEY (recipient) REFERENCES users(username),
-            FOREIGN KEY (sender) REFERENCES users(username)
+            timestamp DATETIME NOT NULL,
+            FOREIGN KEY (recipient) REFERENCES users(username)
         )
     ''')
     conn.commit()
@@ -46,11 +48,9 @@ class Server:
         init_db()
 
     def start(self):
-        """Inicia o servidor e aguarda por conexões."""
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen()
         print(f"Servidor escutando em {self.host}:{self.port}")
-
         while True:
             client_socket, addr = self.server_socket.accept()
             print(f"Nova conexão de {addr}")
@@ -58,7 +58,6 @@ class Server:
             thread.start()
 
     def handle_client(self, client_socket):
-        """Gerencia a comunicação com um cliente específico."""
         user = None
         buffer = ""
         try:
@@ -66,12 +65,10 @@ class Server:
                 data = client_socket.recv(2048).decode('utf-8')
                 if not data:
                     break
-                
                 buffer += data
                 while '\n' in buffer:
                     message_str, buffer = buffer.split('\n', 1)
                     request = loads(message_str)
-                    
                     command = request.get('command')
 
                     if command == 'register':
@@ -85,7 +82,6 @@ class Server:
                             self._route_message(request)
                         elif command == 'typing':
                             self._notify_typing(request)
-
         except (ConnectionResetError, ValueError, ConnectionAbortedError):
             print(f"Conexão com {user if user else 'desconhecido'} perdida.")
         finally:
@@ -98,13 +94,12 @@ class Server:
             client_socket.close()
 
     def _register(self, client_socket, request):
-        """Registra um novo usuário no banco de dados."""
         username = request.get('username')
         password = request.get('password')
-        conn = connect('chat.db')
+        conn = connect('chat.db', check_same_thread=False)
         cursor = conn.cursor()
         try:
-            cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, password))
+            cursor.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, hash_password(password)))
             conn.commit()
             send_with_delimiter(client_socket, {"status": "ok", "message": "Registrado com sucesso!"})
         except IntegrityError:
@@ -113,22 +108,19 @@ class Server:
             conn.close()
 
     def _login(self, client_socket, request):
-        """Autentica um usuário."""
         username = request.get('username')
         password = request.get('password')
-        conn = connect('chat.db')
+        conn = connect('chat.db', check_same_thread=False)
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE username = ? AND password = ?", (username, password))
+        cursor.execute("SELECT * FROM users WHERE username = ? AND password_hash = ?", (username, hash_password(password)))
         user_data = cursor.fetchone()
         conn.close()
 
         if user_data:
             with self.lock:
                 self.clients[username] = client_socket
-
             send_with_delimiter(client_socket, {"status": "ok", "message": "Login bem-sucedido!"})
             print(f"Usuário '{username}' logado.")
-
             self._broadcast_status(username, 'online')
             self._send_user_list()
             self._send_offline_messages(username)
@@ -138,13 +130,11 @@ class Server:
             return None
 
     def _send_user_list(self):
-        """Envia a lista de usuários para todos os clientes conectados."""
-        conn = connect('chat.db')
+        conn = connect('chat.db', check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute("SELECT username FROM users")
         all_users = [row[0] for row in cursor.fetchall()]
         conn.close()
-
         with self.lock:
             online_users = list(self.clients.keys())
             user_list_with_status = {user: ('online' if user in online_users else 'offline') for user in all_users}
@@ -153,56 +143,41 @@ class Server:
                 send_with_delimiter(client_sock, response)
 
     def _route_message(self, request):
-        """Roteia uma mensagem para o destinatário ou a armazena se offline."""
         recipient = request.get('to')
-        sender = request.get('from')
-        message_text = request.get('body')
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        request['timestamp'] = timestamp
-
+        request['timestamp'] = str(datetime.now())
         with self.lock:
             recipient_socket = self.clients.get(recipient)
-
         if recipient_socket:
             send_with_delimiter(recipient_socket, request)
         else:
-            self._store_offline_message(recipient, sender, message_text, timestamp)
+            self._store_offline_message(request)
 
-    def _store_offline_message(self, recipient, sender, message, timestamp):
-        """Armazena uma mensagem no banco para um usuário offline."""
-        conn = connect('chat.db')
+    def _store_offline_message(self, request):
+        conn = connect('chat.db', check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute("INSERT INTO offline_messages (recipient, sender, message, timestamp) VALUES (?, ?, ?, ?)",
-                       (recipient, sender, message, timestamp))
+                       (request.get('to'), request.get('from'), request.get('body'), datetime.now()))
         conn.commit()
         conn.close()
-        print(f"Mensagem de '{sender}' para '{recipient}' (offline) armazenada.")
+        print(f"Mensagem de '{request.get('from')}' para '{request.get('to')}' (offline) armazenada.")
 
     def _send_offline_messages(self, username):
-        """Envia mensagens offline para o usuário que acabou de conectar."""
-        conn = connect('chat.db')
+        conn = connect('chat.db', check_same_thread=False)
         cursor = conn.cursor()
-        cursor.execute("SELECT sender, message, timestamp FROM offline_messages WHERE recipient = ?", (username,))
+        cursor.execute("SELECT sender, message, timestamp FROM offline_messages WHERE recipient = ? ORDER BY timestamp ASC", (username,))
         messages = cursor.fetchall()
-
         if messages:
             with self.lock:
                 client_sock = self.clients.get(username)
-            
             if client_sock:
                 for sender, message, timestamp in messages:
-                    msg_packet = {
-                        "command": "msg", "from": sender, "to": username,
-                        "body": message, "timestamp": timestamp
-                    }
+                    msg_packet = {"command": "msg", "from": sender, "to": username, "body": message, "timestamp": str(timestamp)}
                     send_with_delimiter(client_sock, msg_packet)
-                
                 cursor.execute("DELETE FROM offline_messages WHERE recipient = ?", (username,))
                 conn.commit()
         conn.close()
 
     def _notify_typing(self, request):
-        """Notifica o destinatário que o remetente está digitando."""
         recipient = request.get('to')
         with self.lock:
             recipient_socket = self.clients.get(recipient)
@@ -210,7 +185,6 @@ class Server:
             send_with_delimiter(recipient_socket, request)
 
     def _broadcast_status(self, username, status):
-        """Informa a todos sobre a mudança de status de um usuário."""
         response = {"command": "status_update", "user": username, "status": status}
         with self.lock:
             for client_sock in self.clients.values():
